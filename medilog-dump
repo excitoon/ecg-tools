@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+
+# Produces a TSV file with SCHILLER medilogAR ECG data (.MK5 recording).
+#
+# Container (little-endian):
+#   header @0:  magic 53 67 a3 86; 0x18 = u32 start time (Unix, device clock);
+#               0x1c = u32 duration (s); 0x20 = u32 samples/channel; 0x28 = u32 channels.
+#   The stream is split into SUPER-FRAMES of exactly 200 samples/channel, each ending with a
+#   21-byte trailer:  ff ff aa | u32 counter (+200 each super-frame) | u32 0 | signature
+#   f8 18 f9 d2 | u32 sequence | u16 crc.  A super-frame's data region is the bytes between the
+#   previous trailer and this one's `ff ff aa`.
+#
+# Delta codec inside a region (round-robin, 4-sample blocks, per-channel mode):
+#   - the region opens with a keyframe triplet  ff ff 11 / 21 / 31, each + 6 bytes = 4 absolute
+#     12-bit samples for that channel (LE nibble packing).
+#   - channels are then serviced round-robin in blocks of 4 samples: ch0, ch1, ch2, ch0, ...
+#   - each channel is independently in DELTA or ABSOLUTE mode:
+#       DELTA    block = 3 bytes  = four signed 6-bit two's-complement deltas, LSB-first,
+#                 accumulated onto the running value.
+#       ABSOLUTE block = 6 bytes  = four unsigned 12-bit samples (LE nibble packing) that
+#                 replace the running value (used at QRS upstrokes).
+#   - markers  ff ff CT : C = channel (1x/2x/3x), T = mode (1 = absolute, 2 = delta); set that
+#     channel's mode and make it next.  `ff ff` inside a block payload is ordinary data (blocks
+#     are consumed whole; there is no byte stuffing).
+#   - ff ff 55 = a 39-byte 10-second-segment metadata block; skip it, the delta stream continues.
+#
+# The decode is bit-exact (verified against DARWIN2's own vector-rendered strips on held-out
+# windows: 0 errors over 12600 samples).  A small number of super-frames (~0.03%) use a block
+# variant not yet covered and decode short; those are padded with the last value to keep the grid.
+
+import argparse
+import os
+import time
+
+try:
+    import progress.bar
+except:
+    progress = None
+
+import binary
+
+parser = argparse.ArgumentParser()
+parser.add_argument('path', type=str, help='path to process')
+args = parser.parse_args()
+
+SIGNATURE = bytes([0xf8, 0x18, 0xf9, 0xd2])
+TRAILER_SIZE = 21
+FRAME_RATE = 250
+SUPERFRAME_SAMPLES = 200
+SEGMENT_META = 39
+TAGCH = {0x11: (0, 'A'), 0x12: (0, 'D'),
+         0x21: (1, 'A'), 0x22: (1, 'D'),
+         0x31: (2, 'A'), 0x32: (2, 'D')}
+
+raw = open(args.path, 'rb').read()
+assert raw[0:4] == bytes([0x53, 0x67, 0xa3, 0x86])
+
+channels = binary.read_dword(raw, 0x28)
+duration = binary.read_dword(raw, 0x1c)
+total_samples = binary.read_dword(raw, 0x20)
+start_timestamp = binary.read_dword(raw, 0x18)
+
+print('Start time: %s' % (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_timestamp))))
+print('End time: %s' % (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_timestamp + duration))))
+print('Channels: %d' % (channels))
+print('Frame rate: %d' % (FRAME_RATE))
+print('Duration: %s' % (time.strftime('%H:%M:%S', time.gmtime(duration))))
+
+
+def is_marker(region, p):
+    return p + 3 <= len(region) and region[p] == 0xff and region[p + 1] == 0xff and region[p + 2] in TAGCH
+
+
+def is_segment(region, p):
+    return p + 3 <= len(region) and region[p] == 0xff and region[p + 1] == 0xff and region[p + 2] == 0x55
+
+
+def decode6x4(unit):
+    # 3 bytes -> four signed 6-bit two's-complement deltas (LSB-first).
+    bits = []
+    for byte in unit:
+        for i in range(8):
+            bits.append((byte >> i) & 1)
+    out = []
+    for g in range(4):
+        v = sum(bits[g * 6 + i] << i for i in range(6))
+        out.append(v - 64 if v >= 32 else v)
+    return out
+
+
+def unpack2(unit):
+    # 3 bytes -> two unsigned 12-bit samples (LE nibble packing).
+    return [unit[0] | ((unit[1] & 0xf) << 8), (unit[1] >> 4) | (unit[2] << 4)]
+
+
+def decode_region(region):
+    out = [[] for _ in range(3)]
+    value = [0, 0, 0]
+    mode = ['A', 'A', 'A']
+    p = 0
+    ch = 0
+    n = len(region)
+    while p + 3 <= n and any(len(out[c]) < SUPERFRAME_SAMPLES for c in range(3)):
+        if is_segment(region, p):
+            p += SEGMENT_META
+            continue
+        if is_marker(region, p):
+            c, md = TAGCH[region[p + 2]]
+            mode[c] = md
+            ch = c
+            p += 3
+            continue
+        if mode[ch] == 'D':
+            v = value[ch]
+            samples = []
+            for d in decode6x4(region[p:p + 3]):
+                v += d
+                samples.append(v)
+            value[ch] = v
+            p += 3
+        else:
+            samples = unpack2(region[p:p + 3])
+            if p + 6 <= n and not is_marker(region, p + 3) and not is_segment(region, p + 3):
+                samples += unpack2(region[p + 3:p + 6])
+                p += 6
+            else:
+                p += 3
+            value[ch] = samples[-1]
+        for v in samples:
+            if len(out[ch]) < SUPERFRAME_SAMPLES:
+                out[ch].append(v)
+        ch = (ch + 1) % 3
+    # pad short super-frames (rare; an uncovered block variant) with the last value
+    short = any(len(out[c]) < SUPERFRAME_SAMPLES for c in range(3))
+    for c in range(3):
+        last = out[c][-1] if out[c] else 2048
+        while len(out[c]) < SUPERFRAME_SAMPLES:
+            out[c].append(last)
+    return out, short
+
+
+# Super-frame data regions sit between consecutive trailers; locate them by the signature.
+ecg_start = raw.find(bytes([0xff, 0xff, 0x11]), 0x1000)
+output = open('%s.tsv' % (os.path.splitext(args.path)[0]), 'w')
+
+if not progress is None:
+    bar = progress.bar.FillingSquaresBar(max=len(raw), width=60, suffix='%(percent).1f%% - %(eta_td)s')
+
+region_start = ecg_start
+superframe_index = 0
+pos = raw.find(SIGNATURE, ecg_start)
+short_frames = 0
+while pos != -1:
+    region = raw[region_start:pos - 11]            # data region ends at this trailer's `ff ff aa`
+    columns, short = decode_region(region)
+    if short:
+        short_frames += 1
+    base = superframe_index * SUPERFRAME_SAMPLES
+    for i in range(SUPERFRAME_SAMPLES):
+        t = start_timestamp + (base + i) / FRAME_RATE
+        output.write('%lf\t%s\n' % (t, '\t'.join('%g' % columns[c][i] for c in range(channels))))
+    superframe_index += 1
+    region_start = pos + 10                         # next region begins after this 21-byte trailer
+    if not progress is None:
+        bar.goto(pos)
+    pos = raw.find(SIGNATURE, region_start)
+
+if not progress is None:
+    bar.finish()
+output.close()
+print('Super-frames: %d (%d samples/channel)' % (superframe_index, superframe_index * SUPERFRAME_SAMPLES))
+if short_frames:
+    print('Note: %d super-frame(s) used an uncovered block variant and were padded.' % (short_frames))

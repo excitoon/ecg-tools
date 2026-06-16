@@ -1,1 +1,13 @@
 __pycache__/
+.DS_Store
+
+# recordings, exports and derived/cache data (never commit patient data)
+*.MK5
+*.MK5.bak
+*.tsv
+*.npy
+*.npz
+
+# figures and scratch
+*.png
+_tmp_*.py
