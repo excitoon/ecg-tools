@@ -23,10 +23,20 @@
 #     channel's mode and make it next.  `ff ff` inside a block payload is ordinary data (blocks
 #     are consumed whole; there is no byte stuffing).
 #   - ff ff 55 = a 39-byte 10-second-segment metadata block; skip it, the delta stream continues.
+#   - 11-byte metadata markers  ff ff XX | u32 | 00 00 00 00  carry no samples; skip 11, the
+#     stream continues (round-robin channel unchanged).  XX in {13,14,23,24,33,34} = per-channel
+#     event markers (C=channel, T=3/4; the u32 is a flags/id field); XX=0x56 = a global-clock
+#     marker (u32 = 64*sample_counter + 804, a sibling of the 0x55 segment).  These occur ONLY at
+#     a round-robin cycle boundary (ch0 next, all channels level); the trailing zero-u32 alone is
+#     a weak gate (4-zero runs are common in delta data), so the cycle-boundary position is what
+#     actually distinguishes a real marker from a coincidental ff-ff pair inside a block payload.
+#     A region may also OPEN with one of these (before the keyframe triplet).
 #
 # The decode is bit-exact (verified against DARWIN2's own vector-rendered strips on held-out
-# windows: 0 errors over 12600 samples).  A small number of super-frames (~0.03%) use a block
-# variant not yet covered and decode short; those are padded with the last value to keep the grid.
+# windows: 0 errors over 12600 samples) and STRICT 100%: every super-frame decodes to exactly 200
+# samples/channel (the 11-byte markers above closed the last ~0.03%, which were previously padded).
+# Sample VALUES inside an event burst have no external ground truth, so they are corroborated by
+# internal absolute re-anchor keyframes + next-super-frame continuity rather than externally proven.
 
 import argparse
 import os
@@ -51,6 +61,8 @@ SEGMENT_META = 39
 TAGCH = {0x11: (0, 'A'), 0x12: (0, 'D'),
          0x21: (1, 'A'), 0x22: (1, 'D'),
          0x31: (2, 'A'), 0x32: (2, 'D')}
+META_TAGS = {0x13, 0x14, 0x23, 0x24, 0x33, 0x34, 0x56}   # 11-byte metadata markers (see header)
+META_SIZE = 11
 
 raw = open(args.path, 'rb').read()
 assert raw[0:4] == bytes([0x53, 0x67, 0xa3, 0x86])
@@ -73,6 +85,13 @@ def is_marker(region, p):
 
 def is_segment(region, p):
     return p + 3 <= len(region) and region[p] == 0xff and region[p + 1] == 0xff and region[p + 2] == 0x55
+
+
+def is_metadata(region, p):
+    # 11-byte metadata marker  ff ff XX | u32 | 00 00 00 00.  Weak on its own (the trailing zero-u32
+    # is common in delta data), so the caller only honours it at a round-robin cycle boundary.
+    return (p + META_SIZE <= len(region) and region[p] == 0xff and region[p + 1] == 0xff
+            and region[p + 2] in META_TAGS and region[p + 7:p + 11] == b'\x00\x00\x00\x00')
 
 
 def decode6x4(unit):
@@ -103,6 +122,11 @@ def decode_region(region):
     while p + 3 <= n and any(len(out[c]) < SUPERFRAME_SAMPLES for c in range(3)):
         if is_segment(region, p):
             p += SEGMENT_META
+            continue
+        # 11-byte metadata markers are honoured only at a round-robin cycle boundary (ch0 next,
+        # all channels level); this rejects coincidental ff-ff pairs that fall mid-block.
+        if ch == 0 and len(out[0]) == len(out[1]) == len(out[2]) and is_metadata(region, p):
+            p += META_SIZE
             continue
         if is_marker(region, p):
             c, md = TAGCH[region[p + 2]]
@@ -165,9 +189,22 @@ while pos != -1:
         bar.goto(pos)
     pos = raw.find(SIGNATURE, region_start)
 
+# The recording can end mid-super-frame: the bytes after the last trailer hold a final PARTIAL
+# super-frame with no closing `ff ff aa`.  Its real length is the header sample count minus what the
+# full super-frames already covered (the rest of the tail is unwritten erase-sentinel).  Emit those.
+remainder = total_samples - superframe_index * SUPERFRAME_SAMPLES
+if remainder > 0:
+    columns, _ = decode_region(raw[region_start:])
+    base = superframe_index * SUPERFRAME_SAMPLES
+    for i in range(min(remainder, len(columns[0]))):
+        t = start_timestamp + (base + i) / FRAME_RATE
+        output.write('%lf\t%s\n' % (t, '\t'.join('%g' % columns[c][i] for c in range(channels))))
+
 if not progress is None:
     bar.finish()
 output.close()
-print('Super-frames: %d (%d samples/channel)' % (superframe_index, superframe_index * SUPERFRAME_SAMPLES))
+emitted = superframe_index * SUPERFRAME_SAMPLES + max(0, remainder)
+print('Super-frames: %d full + %d tail = %d samples/channel (declared %d)' % (
+    superframe_index, max(0, remainder), emitted, total_samples))
 if short_frames:
     print('Note: %d super-frame(s) used an uncovered block variant and were padded.' % (short_frames))
